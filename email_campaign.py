@@ -31,9 +31,10 @@ from PySide6.QtWidgets import (
     QHeaderView, QMessageBox, QProgressBar, QDialog, QDialogButtonBox,
     QAbstractItemView, QComboBox, QCheckBox, QListWidget,
     QSplitter, QPlainTextEdit, QFrame, QCompleter, QSizePolicy,
+    QSystemTrayIcon, QMenu,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QStringListModel, QTimer
-from PySide6.QtGui import QColor, QFont, QPixmap
+from PySide6.QtGui import QColor, QFont, QPixmap, QIcon, QAction, QPainter
 
 
 # =============================================================================
@@ -874,6 +875,9 @@ class WorkerThread(QThread):
     progress_signal = Signal(int, int)
     finished_signal = Signal(object)
     error_signal = Signal(str)
+    # --- НОВОЕ: сигнал обновления статуса компании для мониторинга ---
+    company_status_signal = Signal(str, str, str, str)
+    # (company_name, template_name, action_status, details)
 
     def __init__(self, task_type, df, smtp_cfg, imap_cfg, settings,
                  templates=None, send_task=None, signature=None):
@@ -951,10 +955,23 @@ class WorkerThread(QThread):
         self.log_signal.emit(f"Компаний к отправке: {len(target_indices)}")
 
         tpl_map = {t["id"]: t for t in self.templates}
+        tpl_name_map = {t["id"]: t["name"] for t in self.templates}
         progress_data = task.get("company_progress", {})
         sent_today = 0
         skipped = 0
         total = len(target_indices)
+
+        # --- НОВОЕ: отправляем начальные статусы «Ожидание» для всех компаний ---
+        for idx in target_indices:
+            company = str(self.df.at[idx, "Название"])
+            cp = progress_data.get(company, {"step_index": 0})
+            step_idx = cp.get("step_index", 0)
+            if step_idx < len(steps):
+                tpl_id = steps[step_idx].get("template_id", "")
+                tpl_name = tpl_name_map.get(tpl_id, tpl_id)
+            else:
+                tpl_name = "—"
+            self.company_status_signal.emit(company, tpl_name, "⏳ Ожидание", "В очереди")
 
         for i, idx in enumerate(target_indices):
             self.progress_signal.emit(i + 1, total)
@@ -964,6 +981,12 @@ class WorkerThread(QThread):
                 self.log_signal.emit(
                     f"  ⚠ ЛИМИТ {daily_limit} писем/день достигнут. Остановка."
                 )
+                # Помечаем оставшихся
+                for j in range(i, len(target_indices)):
+                    rem_company = str(self.df.at[target_indices[j], "Название"])
+                    self.company_status_signal.emit(
+                        rem_company, "", "⛔ Лимит", "Перенос на завтра"
+                    )
                 break
 
             row = self.df.loc[idx]
@@ -971,8 +994,10 @@ class WorkerThread(QThread):
             all_emails = self.df.at[idx, "_parsed_emails"]
 
             if row["replied"] == 1 and filters.get("exclude_replied", True):
+                self.company_status_signal.emit(company, "", "⏭ Пропуск", "Уже ответил")
                 continue
             if not all_emails:
+                self.company_status_signal.emit(company, "", "⏭ Пропуск", "Нет email")
                 continue
 
             cp = progress_data.get(company, {
@@ -985,6 +1010,7 @@ class WorkerThread(QThread):
                     step_idx = len(steps) - 1
                 else:
                     skipped += 1
+                    self.company_status_signal.emit(company, "", "✅ Завершено", "Все шаги пройдены")
                     continue
 
             step = steps[step_idx]
@@ -998,27 +1024,52 @@ class WorkerThread(QThread):
                 dep_str = cp.get(f"step_{after_step}_date")
                 if not dep_str:
                     skipped += 1
+                    self.company_status_signal.emit(
+                        company, tpl_name_map.get(tpl_id, ""),
+                        "⏳ Ожидание", "Ждёт завершения шага"
+                    )
                     continue
                 dep_date = parse_date(dep_str)
                 if dep_date and today < dep_date + timedelta(days=delay):
+                    next_date = (dep_date + timedelta(days=delay)).strftime("%d.%m.%Y")
                     skipped += 1
+                    self.company_status_signal.emit(
+                        company, tpl_name_map.get(tpl_id, ""),
+                        "🕐 Запланировано", f"Отправка с {next_date}"
+                    )
                     continue
             else:
                 lsd = cp.get("last_sent_date")
                 if lsd and delay > 0:
                     ld = parse_date(lsd)
                     if ld and today < ld + timedelta(days=delay):
+                        next_date = (ld + timedelta(days=delay)).strftime("%d.%m.%Y")
                         skipped += 1
+                        self.company_status_signal.emit(
+                            company, tpl_name_map.get(tpl_id, ""),
+                            "🕐 Запланировано", f"Отправка с {next_date}"
+                        )
                         continue
                 if lsd:
                     ld = parse_date(lsd)
                     if ld and ld.date() == today.date():
+                        self.company_status_signal.emit(
+                            company, tpl_name_map.get(tpl_id, ""),
+                            "✅ Отправлено", "Уже отправлено сегодня"
+                        )
                         continue
 
             template = tpl_map.get(tpl_id)
             if not template:
                 self.log_signal.emit(f"  Шаблон не найден: {tpl_id}")
+                self.company_status_signal.emit(company, tpl_id, "❌ Ошибка", "Шаблон не найден")
                 continue
+
+            # --- НОВОЕ: обновляем статус на «Отправка» ---
+            self.company_status_signal.emit(
+                company, template["name"], "📤 Отправка...",
+                f"Email: {', '.join(all_emails[:2])}"
+            )
 
             # === ОТПРАВКА НА ВСЕ EMAIL КОМПАНИИ ===
             row_dict = self.df.loc[idx].to_dict()
@@ -1048,6 +1099,12 @@ class WorkerThread(QThread):
                         time.sleep(mini_delay)
 
             if company_sent > 0:
+                # --- НОВОЕ: обновляем статус на «Отправлено» ---
+                self.company_status_signal.emit(
+                    company, template["name"], "✅ Отправлено",
+                    f"Писем: {company_sent}"
+                )
+
                 # Обновляем данные компании
                 hist = str(self.df.at[idx, "sent_history"])
                 emails_str = ",".join(all_emails[:3])
@@ -1098,7 +1155,16 @@ class WorkerThread(QThread):
                     self.settings["max_delay"]
                 )
                 self.log_signal.emit(f"  Пауза {ds} сек...")
+                self.company_status_signal.emit(
+                    company, template["name"], "✅ Отправлено",
+                    f"Пауза {ds} сек..."
+                )
                 time.sleep(ds)
+            else:
+                self.company_status_signal.emit(
+                    company, template.get("name", ""), "❌ Ошибка",
+                    "Не удалось отправить"
+                )
 
         # Сохранение
         task["company_progress"] = progress_data
@@ -1937,6 +2003,27 @@ class TaskEditDialog(QDialog):
 
 
 # =============================================================================
+# ИКОНКА ДЛЯ ТРЕЯ (генерируется программно, без файла)
+# =============================================================================
+
+def create_tray_icon():
+    """Создаёт простую иконку 64x64 для системного трея."""
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor("#4a90d9"))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(4, 4, 56, 56, 12, 12)
+    painter.setPen(QColor("#ffffff"))
+    font = QFont("Segoe UI", 28, QFont.Bold)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "✉")
+    painter.end()
+    return QIcon(pixmap)
+
+
+# =============================================================================
 # ГЛАВНОЕ ОКНО
 # =============================================================================
 
@@ -1957,7 +2044,12 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(300)
         self._search_timer.timeout.connect(self._do_search)
         self._pending_search = ""
+
+        # --- НОВОЕ: данные мониторинга ---
+        self._monitor_data = {}  # company -> {template, status, details, time}
+
         self._build_ui()
+        self._setup_tray()
         self._try_load_db()
 
     def _try_load_db(self):
@@ -1983,18 +2075,77 @@ class MainWindow(QMainWindow):
                 self._search_cache_cols[col] = self.df[col].astype(str).str.lower()
         self._search_cache_valid = True
 
+    # ==================== ТРЕЙ ====================
+
+    def _setup_tray(self):
+        """Настройка иконки в системном трее."""
+        self._tray_icon = QSystemTrayIcon(self)
+        self._tray_icon.setIcon(create_tray_icon())
+        self._tray_icon.setToolTip("Email Campaign")
+
+        tray_menu = QMenu()
+        action_show = QAction("Показать", self)
+        action_show.triggered.connect(self._show_from_tray)
+        tray_menu.addAction(action_show)
+
+        action_hide = QAction("Свернуть в трей", self)
+        action_hide.triggered.connect(self._hide_to_tray)
+        tray_menu.addAction(action_hide)
+
+        tray_menu.addSeparator()
+
+        action_quit = QAction("Выход", self)
+        action_quit.triggered.connect(self._quit_app)
+        tray_menu.addAction(action_quit)
+
+        self._tray_icon.setContextMenu(tray_menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        """Двойной клик по иконке трея — показать окно."""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_from_tray()
+
+    def _hide_to_tray(self):
+        """Свернуть окно в трей."""
+        self.hide()
+        self._tray_icon.showMessage(
+            "Email Campaign",
+            "Приложение свёрнуто в трей. Двойной клик — развернуть.",
+            QSystemTrayIcon.Information,
+            2000,
+        )
+
+    def _show_from_tray(self):
+        """Развернуть окно из трея."""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _quit_app(self):
+        """Полный выход из приложения."""
+        self._tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        """Перехватываем закрытие окна — сворачиваем в трей вместо выхода."""
+        event.ignore()
+        self._hide_to_tray()
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
-        tabs = QTabWidget()
-        root.addWidget(tabs)
-        tabs.addTab(self._build_settings_tab(), "  Настройки  ")
-        tabs.addTab(self._build_templates_tab(), "  Шаблоны  ")
-        tabs.addTab(self._build_db_tab(), "  База  ")
-        tabs.addTab(self._build_campaign_tab(), "  Рассылка  ")
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+        self.tabs.addTab(self._build_settings_tab(), "  Настройки  ")
+        self.tabs.addTab(self._build_templates_tab(), "  Шаблоны  ")
+        self.tabs.addTab(self._build_db_tab(), "  База  ")
+        self.tabs.addTab(self._build_campaign_tab(), "  Рассылка  ")
+        self.tabs.addTab(self._build_monitor_tab(), "  Мониторинг  ")
 
     # ==================== НАСТРОЙКИ ====================
 
@@ -2376,6 +2527,154 @@ class MainWindow(QMainWindow):
         self._refresh_tasks_table()
         return page
 
+    # ==================== МОНИТОРИНГ (НОВАЯ ВКЛАДКА) ====================
+
+    def _build_monitor_tab(self):
+        """Вкладка мониторинга: показывает в реальном времени статус каждой компании."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+
+        # Заголовок + общая инфо
+        top_row = QHBoxLayout()
+        self.monitor_status_label = QLabel("Статус: Не запущено")
+        self.monitor_status_label.setStyleSheet(
+            "color: #c0c0c0; font-size: 14px; font-weight: bold;"
+        )
+        top_row.addWidget(self.monitor_status_label)
+        top_row.addStretch()
+
+        self.monitor_stats_label = QLabel("")
+        self.monitor_stats_label.setStyleSheet("color: #888; font-size: 12px;")
+        top_row.addWidget(self.monitor_stats_label)
+
+        btn_clear_monitor = QPushButton("Очистить")
+        btn_clear_monitor.setFixedWidth(100)
+        btn_clear_monitor.clicked.connect(self._clear_monitor)
+        top_row.addWidget(btn_clear_monitor)
+
+        layout.addLayout(top_row)
+
+        # Фильтр по статусу
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Фильтр:"))
+        self.monitor_filter = QComboBox()
+        self.monitor_filter.addItems([
+            "Все", "📤 Отправка...", "✅ Отправлено", "🕐 Запланировано",
+            "⏳ Ожидание", "⏭ Пропуск", "❌ Ошибка", "⛔ Лимит"
+        ])
+        self.monitor_filter.currentTextChanged.connect(self._filter_monitor_table)
+        filter_row.addWidget(self.monitor_filter)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        # Таблица мониторинга
+        self.monitor_table = QTableWidget()
+        self.monitor_table.setColumnCount(5)
+        self.monitor_table.setHorizontalHeaderLabels([
+            "Компания", "Шаблон", "Статус", "Детали", "Время"
+        ])
+        self.monitor_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.monitor_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.monitor_table.verticalHeader().setVisible(False)
+        mh = self.monitor_table.horizontalHeader()
+        mh.setSectionResizeMode(0, QHeaderView.Stretch)
+        mh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        mh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        mh.setSectionResizeMode(3, QHeaderView.Stretch)
+        mh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        layout.addWidget(self.monitor_table, 1)
+
+        return page
+
+    def _on_company_status_update(self, company, template, status, details):
+        """Слот: обновление статуса компании из рабочего потока."""
+        now_str = datetime.now().strftime("%H:%M:%S")
+        self._monitor_data[company] = {
+            "template": template,
+            "status": status,
+            "details": details,
+            "time": now_str,
+        }
+        self._refresh_monitor_table()
+
+    def _refresh_monitor_table(self):
+        """Перерисовать таблицу мониторинга."""
+        current_filter = self.monitor_filter.currentText() if hasattr(self, 'monitor_filter') else "Все"
+
+        items = list(self._monitor_data.items())
+
+        if current_filter != "Все":
+            items = [(c, d) for c, d in items if d["status"].startswith(current_filter.split()[0])]
+
+        self.monitor_table.setUpdatesEnabled(False)
+        self.monitor_table.setRowCount(len(items))
+
+        status_colors = {
+            "📤": QColor("#4a90d9"),   # Отправка — синий
+            "✅": QColor("#7a9a6a"),   # Отправлено — зелёный
+            "🕐": QColor("#a09060"),   # Запланировано — жёлтый
+            "⏳": QColor("#808080"),   # Ожидание — серый
+            "⏭": QColor("#707070"),    # Пропуск — тёмно-серый
+            "❌": QColor("#c0392b"),   # Ошибка — красный
+            "⛔": QColor("#e67e22"),   # Лимит — оранжевый
+        }
+
+        for rn, (company, data) in enumerate(items):
+            # Компания
+            ci = QTableWidgetItem(company)
+            self.monitor_table.setItem(rn, 0, ci)
+
+            # Шаблон
+            ti = QTableWidgetItem(data["template"])
+            ti.setForeground(QColor("#999"))
+            self.monitor_table.setItem(rn, 1, ti)
+
+            # Статус
+            si = QTableWidgetItem(data["status"])
+            si.setTextAlignment(Qt.AlignCenter)
+            emoji = data["status"][:2] if data["status"] else ""
+            color = status_colors.get(emoji, QColor("#b0b0b0"))
+            si.setForeground(color)
+            self.monitor_table.setItem(rn, 2, si)
+
+            # Детали
+            di = QTableWidgetItem(data["details"])
+            di.setForeground(QColor("#808080"))
+            self.monitor_table.setItem(rn, 3, di)
+
+            # Время
+            tmi = QTableWidgetItem(data["time"])
+            tmi.setForeground(QColor("#666"))
+            tmi.setTextAlignment(Qt.AlignCenter)
+            self.monitor_table.setItem(rn, 4, tmi)
+
+        self.monitor_table.setUpdatesEnabled(True)
+
+        # Обновляем статистику
+        total = len(self._monitor_data)
+        sent = sum(1 for d in self._monitor_data.values() if "✅" in d["status"])
+        scheduled = sum(1 for d in self._monitor_data.values() if "🕐" in d["status"])
+        errors = sum(1 for d in self._monitor_data.values() if "❌" in d["status"])
+        sending = sum(1 for d in self._monitor_data.values() if "📤" in d["status"])
+
+        self.monitor_stats_label.setText(
+            f"Всего: {total}  |  Отправлено: {sent}  |  "
+            f"Отправка: {sending}  |  Запланировано: {scheduled}  |  Ошибки: {errors}"
+        )
+
+    def _filter_monitor_table(self, text):
+        self._refresh_monitor_table()
+
+    def _clear_monitor(self):
+        """Очистить данные мониторинга."""
+        self._monitor_data.clear()
+        self.monitor_table.setRowCount(0)
+        self.monitor_status_label.setText("Статус: Не запущено")
+        self.monitor_stats_label.setText("")
+
+    # ==================== ЗАДАНИЯ ====================
+
     def _refresh_tasks_table(self):
         self.tasks = load_tasks()
         self.tasks_table.setRowCount(len(self.tasks))
@@ -2450,6 +2749,13 @@ class MainWindow(QMainWindow):
         if not self._validate(): return
         self._set_btns(False)
         self.progress_bar.setValue(0)
+
+        # --- НОВОЕ: очищаем монитор и переключаемся на вкладку ---
+        self._monitor_data.clear()
+        task_name = self.tasks[r].get("name", "")
+        self.monitor_status_label.setText(f"Статус: ▶ {task_name}")
+        self.tabs.setCurrentIndex(4)  # вкладка Мониторинг
+
         self.worker = WorkerThread(
             "execute_task", self.df,
             self._smtp(), self._imap(), self._settings(),
@@ -2474,6 +2780,8 @@ class MainWindow(QMainWindow):
         self.worker.progress_signal.connect(self._on_prog)
         self.worker.finished_signal.connect(self._on_fin)
         self.worker.error_signal.connect(self._on_err)
+        # --- НОВОЕ: подключаем сигнал мониторинга ---
+        self.worker.company_status_signal.connect(self._on_company_status_update)
 
     # ==================== ОБЩИЕ ====================
 
@@ -2570,10 +2878,13 @@ class MainWindow(QMainWindow):
         self._refresh_tasks_table()
         self._set_btns(True)
         self._log("-- Завершено --")
+        # --- НОВОЕ: обновляем статус мониторинга ---
+        self.monitor_status_label.setText("Статус: ✅ Завершено")
 
     def _on_err(self, msg):
         self._log(f"ОШИБКА: {msg}")
         self._set_btns(True)
+        self.monitor_status_label.setText("Статус: ❌ Ошибка")
         QMessageBox.critical(self, "Ошибка", msg)
 
 
@@ -2581,6 +2892,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLESHEET)
+    app.setQuitOnLastWindowClosed(False)  # Не закрывать при сворачивании в трей
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
